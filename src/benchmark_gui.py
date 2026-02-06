@@ -4,18 +4,19 @@ GUI интерфейс для бенчмарка LLM моделей
 
 import asyncio
 import logging
+import os
 import sys
 from typing import Dict, List, Optional
 
 import requests
-from PyQt6.QtCore import QThread, pyqtSignal, QSettings
+from PyQt6.QtCore import QThread, pyqtSignal, QSettings, Qt
 from PyQt6.QtGui import QFont, QColor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QFormLayout, QLabel, QLineEdit, QPushButton,
     QTextEdit, QComboBox, QSpinBox, QCheckBox, QMessageBox,
     QGroupBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QProgressBar, QInputDialog
+    QHeaderView, QProgressBar, QInputDialog, QSizePolicy, QScrollArea
 )
 
 from benchmark import LLMBenchmark, get_app_path
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 class ApiDataManager:
     """Класс для управления данными из API"""
 
-    BASE_URL = "http://10.10.1.10:18005/api/benchmark/"
+    BASE_URL = "https://nizamov.school/inference_benchmark/"
 
     def __init__(self):
         self.models = []
@@ -184,6 +185,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("LLM Benchmark GUI")
         self.setGeometry(100, 100, 1200, 800)
+        self.setMinimumSize(900, 600)
 
         self.api_manager = ApiDataManager()
         self.current_results = None
@@ -230,35 +232,51 @@ class MainWindow(QMainWindow):
 
     def setup_params_tab(self):
         """Настройка вкладки параметров"""
+        # Создаём область прокрутки
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        # Внутренний виджет для прокрутки
         params_widget = QWidget()
         params_layout = QVBoxLayout(params_widget)
 
         # Группа основных параметров
         params_group = QGroupBox("Параметры бенчмарка")
         params_form = QFormLayout(params_group)
+        params_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         # Выбор движка инференса
         self.inference_combo = QComboBox()
         self.inference_combo.addItems(["vLLM", "Ollama", "llama.cpp"])
+        self.inference_combo.setMinimumWidth(200)
+        self.inference_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.inference_combo.currentTextChanged.connect(self.on_inference_changed)
         params_form.addRow("Движок инференса:", self.inference_combo)
 
         # Выбор версии инференса
         self.inference_version_combo = QComboBox()
         self.inference_version_combo.setEditable(True)
+        self.inference_version_combo.setMinimumWidth(200)
+        self.inference_version_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         params_form.addRow("Версия инференса:", self.inference_version_combo)
 
         # Выбор модели
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
+        self.model_combo.setMinimumWidth(200)
+        self.model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         params_form.addRow("Модель:", self.model_combo)
 
         # URL API сервера
         self.base_url_edit = QLineEdit("http://localhost:8000/v1")
+        self.base_url_edit.setMinimumWidth(200)
         params_form.addRow("URL API сервера:", self.base_url_edit)
 
         # Параметры запуска
         self.launch_edit = QLineEdit()
+        self.launch_edit.setMinimumWidth(200)
         self.launch_edit.setPlaceholderText("Например: vllm serve model --tp 2 --gpu-memory-utilization 0.9")
         params_form.addRow("Параметры запуска:", self.launch_edit)
 
@@ -267,11 +285,14 @@ class MainWindow(QMainWindow):
         self.gpu_table.setColumnCount(3)
         self.gpu_table.setHorizontalHeaderLabels(["Модель GPU", "Количество", "Удалить"])
         self.gpu_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.gpu_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.gpu_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.gpu_table.verticalHeader().setVisible(False)  # Скрываем колонку с номерами строк
+        self.gpu_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.gpu_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.gpu_table.setColumnWidth(1, 100)
+        self.gpu_table.setColumnWidth(2, 80)
+        self.gpu_table.verticalHeader().setVisible(False)
         self.gpu_table.setRowCount(0)
-        self.gpu_table.setMinimumHeight(150)  # Минимальная высота таблицы
+        self.gpu_table.setMinimumHeight(120)
+        self.gpu_table.setMinimumWidth(400)
 
         params_form.addRow("GPU конфигурация:", self.gpu_table)
 
@@ -283,25 +304,30 @@ class MainWindow(QMainWindow):
         # Опциональные параметры
         optional_group = QGroupBox("Дополнительные параметры")
         optional_form = QFormLayout(optional_group)
+        optional_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         # API ключ
         self.api_key_edit = QLineEdit("local")
+        self.api_key_edit.setMinimumWidth(200)
         optional_form.addRow("API ключ:", self.api_key_edit)
 
         # Описание
         self.description_edit = QLineEdit()
+        self.description_edit.setMinimumWidth(200)
         optional_form.addRow("Описание:", self.description_edit)
 
         # Количество параллельных запросов
         self.parallel_spin = QSpinBox()
         self.parallel_spin.setRange(1, 1000)
         self.parallel_spin.setValue(10)
+        self.parallel_spin.setMinimumWidth(100)
         optional_form.addRow("Параллельных запросов:", self.parallel_spin)
 
         # Количество замеров
         self.runs_spin = QSpinBox()
         self.runs_spin.setRange(1, 100)
         self.runs_spin.setValue(3)
+        self.runs_spin.setMinimumWidth(100)
         optional_form.addRow("Количество замеров:", self.runs_spin)
 
         # Запуск в Docker
@@ -319,7 +345,7 @@ class MainWindow(QMainWindow):
 
         # Лог
         self.log_text = QTextEdit()
-        self.log_text.setMaximumHeight(200)
+        self.log_text.setMinimumHeight(150)
         self.log_text.setReadOnly(True)
 
         params_layout.addWidget(params_group)
@@ -328,8 +354,12 @@ class MainWindow(QMainWindow):
         params_layout.addWidget(self.progress_bar)
         params_layout.addWidget(QLabel("Лог:"))
         params_layout.addWidget(self.log_text)
+        params_layout.addStretch()
 
-        self.tab_widget.addTab(params_widget, "Параметры")
+        # Помещаем виджет в область прокрутки
+        scroll_area.setWidget(params_widget)
+
+        self.tab_widget.addTab(scroll_area, "Параметры")
 
     def add_gpu_row(self, model_name="", count=1):
         """Добавляет новую строку в таблицу GPU"""
@@ -339,6 +369,7 @@ class MainWindow(QMainWindow):
         # Добавляем комбобокс в первую ячейку
         combo = QComboBox()
         combo.setEditable(True)
+        combo.setMinimumWidth(150)
         for gpu in self.api_manager.gpu_models:
             combo.addItem(gpu['name'], gpu['id'])
 
@@ -356,11 +387,12 @@ class MainWindow(QMainWindow):
         spin = QSpinBox()
         spin.setRange(1, 10)
         spin.setValue(count)
+        spin.setMinimumWidth(60)
         self.gpu_table.setCellWidget(row, 1, spin)
 
         # Добавляем кнопку удаления в третью ячейку
         delete_btn = QPushButton("✕")
-        delete_btn.setMaximumWidth(40)
+        delete_btn.setFixedWidth(60)
         delete_btn.clicked.connect(lambda: self.remove_gpu_row(row))
         self.gpu_table.setCellWidget(row, 2, delete_btn)
 
@@ -1371,6 +1403,12 @@ def main():
     # Настраиваем логгер
     configure_root_logger(level=logging.INFO)
 
+    # Настройки High DPI для корректного масштабирования на мониторах с 125%, 150% и т.д.
+    os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+
     app = QApplication(sys.argv)
 
     # Устанавливаем шрифт
@@ -1733,6 +1771,16 @@ def main():
 
     QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
         width: 0px;
+    }
+
+    /* Область прокрутки */
+    QScrollArea {
+        background-color: #282a36;
+        border: none;
+    }
+
+    QScrollArea > QWidget > QWidget {
+        background-color: #282a36;
     }
 
     /* Статус бар */
