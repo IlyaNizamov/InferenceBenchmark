@@ -75,17 +75,20 @@ class LLMBenchmark:
         self.inference_version = inference_version
         self.is_docker = is_docker
 
-        if inference == "ollama":
+        if inference.lower() == "ollama":
             self.llm = ChatOllama(base_url=base_url, model=model, temperature=0.1)
         else:
-            self.llm = ChatOpenAI(base_url=base_url, api_key=api_key, model=model, temperature=0.1)
+            self.llm = ChatOpenAI(
+                base_url=base_url, api_key=api_key, model=model,
+                temperature=0.1, timeout=180, max_retries=0
+            )
 
         # Кеш SO-обёрток для каждой схемы из тестовых сценариев
         self._so_cache = {}
         for tc in TEST_CASES:
             if tc.schema not in self._so_cache:
                 self._so_cache[tc.schema] = self.llm.with_structured_output(
-                    schema=tc.schema, include_raw=True
+                    schema=tc.schema, include_raw=True, method="json_mode"
                 )
 
         self.model_name = self._get_model_name()
@@ -345,12 +348,23 @@ class LLMBenchmark:
         """
         start_time = time.time()
 
-        if use_structured_output:
-            so = self._so_cache[test_case.schema]
-            result = so.invoke(test_case.prompt)
-            raw_response = result["raw"]
-        else:
-            raw_response = self.llm.invoke(test_case.prompt)
+        try:
+            if use_structured_output:
+                so = self._so_cache[test_case.schema]
+                result = so.invoke(test_case.prompt)
+                raw_response = result["raw"]
+            else:
+                raw_response = self.llm.invoke(test_case.prompt)
+        except Exception as e:
+            total_time = time.time() - start_time
+            logger.error("Ошибка при запросе к модели (тест '%s', SO=%s): %s: %s",
+                         test_case.name, use_structured_output, type(e).__name__, e)
+            return {
+                "time": total_time,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "tokens_per_second": 0
+            }
 
         total_time = time.time() - start_time
 
@@ -361,6 +375,13 @@ class LLMBenchmark:
         else:
             input_tokens = 0
             output_tokens = 0
+            logger.warning("usage_metadata отсутствует в ответе модели (тест '%s', SO=%s). "
+                           "Проверьте совместимость движка инференса.",
+                           test_case.name, use_structured_output)
+
+        if output_tokens == 0 and usage:
+            logger.warning("output_tokens = 0 при наличии usage_metadata (тест '%s', SO=%s). "
+                           "usage_metadata: %s", test_case.name, use_structured_output, usage)
 
         tokens_per_second = output_tokens / total_time if total_time > 0 and output_tokens > 0 else 0
 
@@ -373,7 +394,7 @@ class LLMBenchmark:
 
     async def _parallel_request(self, test_case: TestCase, request_id: int, use_structured_output: bool = True) -> Dict:
         """Асинхронный запрос к модели (для параллельного выполнения)"""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None, self.single_request, test_case, use_structured_output
         )

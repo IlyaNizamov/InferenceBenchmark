@@ -3,6 +3,7 @@ GUI интерфейс для бенчмарка LLM моделей
 """
 
 import asyncio
+import ctypes
 import logging
 import os
 import sys
@@ -16,13 +17,28 @@ from PyQt6.QtWidgets import (
     QTabWidget, QFormLayout, QLabel, QLineEdit, QPushButton,
     QTextEdit, QComboBox, QSpinBox, QCheckBox, QMessageBox,
     QGroupBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QProgressBar, QInputDialog, QSizePolicy, QScrollArea
+    QHeaderView, QProgressBar, QInputDialog, QSizePolicy, QScrollArea,
+    QDialog
 )
 
 from benchmark import LLMBenchmark, get_app_path
 from logger_config import configure_root_logger
 
 logger = logging.getLogger(__name__)
+
+
+def apply_dark_title_bar(window):
+    """Принудительно включает тёмный заголовок окна на Windows 10 (1809+) и Windows 11"""
+    if sys.platform == "win32":
+        try:
+            hwnd = int(window.winId())
+            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int)
+            )
+        except Exception:
+            pass
 
 
 class ApiDataManager:
@@ -119,39 +135,51 @@ class BenchmarkWorker(QThread):
             self.progress.emit("Запуск прогревочного запроса...")
             benchmark.warmup()
 
-            self.progress.emit("Запуск последовательного теста (без SO)...")
-            seq_no_so = benchmark.run_sequential(
-                num_runs=self.config['runs'],
-                use_structured_output=False
-            )
-
-            self.progress.emit("Запуск последовательного теста (с SO)...")
-            seq_so = benchmark.run_sequential(
-                num_runs=self.config['runs'],
-                use_structured_output=True
-            )
-
-            self.progress.emit("Запуск параллельного теста (без SO)...")
-            par_no_so_result = asyncio.run(benchmark.run_parallel(
-                num_parallel=self.config['parallel'],
-                use_structured_output=False
-            ))
-
-            self.progress.emit("Запуск параллельного теста (с SO)...")
-            par_so_result = asyncio.run(benchmark.run_parallel(
-                num_parallel=self.config['parallel'],
-                use_structured_output=True
-            ))
-
-            # Формируем результаты
+            # Формируем результаты (None = тест пропущен)
             results = {
-                'seq_no_so': seq_no_so['avg_speed'],
-                'seq_so': seq_so['avg_speed'],
-                'par_no_so': par_no_so_result['avg_speed'],
-                'par_so': par_so_result['avg_speed'],
-                'throughput_no_so': par_no_so_result['throughput'],
-                'throughput_so': par_so_result['throughput'],
+                'seq_no_so': None,
+                'seq_so': None,
+                'par_no_so': None,
+                'par_so': None,
+                'throughput_no_so': None,
+                'throughput_so': None,
             }
+
+            if self.config.get('run_seq_no_so', True):
+                self.progress.emit("Запуск последовательного теста (без SO)...")
+                seq_no_so = benchmark.run_sequential(
+                    num_runs=self.config['runs'],
+                    use_structured_output=False
+                )
+                results['seq_no_so'] = seq_no_so['avg_speed']
+
+            if self.config.get('run_seq_so', True):
+                self.progress.emit("Запуск последовательного теста (с SO)...")
+                seq_so = benchmark.run_sequential(
+                    num_runs=self.config['runs'],
+                    use_structured_output=True
+                )
+                results['seq_so'] = seq_so['avg_speed']
+
+            run_throughput = self.config.get('run_throughput', False)
+
+            if self.config.get('run_par_no_so', True):
+                self.progress.emit("Запуск параллельного теста (без SO)...")
+                par_no_so_result = asyncio.run(benchmark.run_parallel(
+                    num_parallel=self.config['parallel'],
+                    use_structured_output=False
+                ))
+                results['par_no_so'] = par_no_so_result['avg_speed']
+                results['throughput_no_so'] = par_no_so_result['throughput'] if run_throughput else 0.0
+
+            if self.config.get('run_par_so', True):
+                self.progress.emit("Запуск параллельного теста (с SO)...")
+                par_so_result = asyncio.run(benchmark.run_parallel(
+                    num_parallel=self.config['parallel'],
+                    use_structured_output=True
+                ))
+                results['par_so'] = par_so_result['avg_speed']
+                results['throughput_so'] = par_so_result['throughput'] if run_throughput else 0.0
 
             logger.info("=" * 80)
             logger.info("БЕНЧМАРК ЗАВЕРШЁН УСПЕШНО")
@@ -173,13 +201,6 @@ class BenchmarkWorker(QThread):
 
 class MainWindow(QMainWindow):
     """Основное окно приложения"""
-
-    # Маппинг между отображаемыми именами инференса и именами в API
-    INFERENCE_DISPLAY_TO_API = {
-        "vLLM": "vLLM",
-        "Ollama": "Ollama",
-        "llama.cpp": "Llama.cpp"
-    }
 
     def __init__(self):
         super().__init__()
@@ -249,7 +270,6 @@ class MainWindow(QMainWindow):
 
         # Выбор движка инференса
         self.inference_combo = QComboBox()
-        self.inference_combo.addItems(["vLLM", "Ollama", "llama.cpp"])
         self.inference_combo.setMinimumWidth(200)
         self.inference_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.inference_combo.currentTextChanged.connect(self.on_inference_changed)
@@ -334,6 +354,30 @@ class MainWindow(QMainWindow):
         self.docker_checkbox = QCheckBox()
         optional_form.addRow("Запуск в Docker:", self.docker_checkbox)
 
+        # Группа выбора тестов
+        tests_group = QGroupBox("Выбор тестов")
+        tests_layout = QVBoxLayout(tests_group)
+
+        self.test_seq_no_so_cb = QCheckBox("Последовательный без SO")
+        self.test_seq_no_so_cb.setChecked(True)
+        tests_layout.addWidget(self.test_seq_no_so_cb)
+
+        self.test_seq_so_cb = QCheckBox("Последовательный с SO")
+        self.test_seq_so_cb.setChecked(True)
+        tests_layout.addWidget(self.test_seq_so_cb)
+
+        self.test_par_no_so_cb = QCheckBox("Параллельный без SO")
+        self.test_par_no_so_cb.setChecked(True)
+        tests_layout.addWidget(self.test_par_no_so_cb)
+
+        self.test_par_so_cb = QCheckBox("Параллельный с SO")
+        self.test_par_so_cb.setChecked(True)
+        tests_layout.addWidget(self.test_par_so_cb)
+
+        self.test_throughput_cb = QCheckBox("Пропускная способность (рассчитывается из параллельных тестов)")
+        self.test_throughput_cb.setChecked(False)
+        tests_layout.addWidget(self.test_throughput_cb)
+
         # Кнопка запуска
         self.start_button = QPushButton("Запустить бенчмарк")
         self.start_button.setObjectName("start_button")
@@ -350,6 +394,7 @@ class MainWindow(QMainWindow):
 
         params_layout.addWidget(params_group)
         params_layout.addWidget(optional_group)
+        params_layout.addWidget(tests_group)
         params_layout.addWidget(self.start_button)
         params_layout.addWidget(self.progress_bar)
         params_layout.addWidget(QLabel("Лог:"))
@@ -485,14 +530,24 @@ class MainWindow(QMainWindow):
         self.history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)  # Только чтение
         self.history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.history_table.verticalHeader().setVisible(False)
+        self.history_table.doubleClicked.connect(self.on_history_double_click)
 
         history_layout.addWidget(QLabel("История запусков из CSV:"))
         history_layout.addWidget(self.history_table)
 
-        # Кнопка обновления истории
+        # Кнопки
+        history_buttons_layout = QHBoxLayout()
+
+        self.compare_btn = QPushButton("Сравнить выбранные")
+        self.compare_btn.clicked.connect(self.compare_selected_runs)
+        history_buttons_layout.addWidget(self.compare_btn)
+
         self.refresh_history_btn = QPushButton("Обновить историю")
         self.refresh_history_btn.clicked.connect(self.load_csv_history)
-        history_layout.addWidget(self.refresh_history_btn)
+        history_buttons_layout.addWidget(self.refresh_history_btn)
+
+        history_buttons_layout.addStretch()
+        history_layout.addLayout(history_buttons_layout)
 
         self.tab_widget.addTab(history_widget, "История")
 
@@ -594,6 +649,17 @@ class MainWindow(QMainWindow):
 
     def update_combos(self):
         """Обновляет содержимое комбобоксов"""
+        # Обновляем типы инференса
+        current_inference = self.inference_combo.currentText()
+        self.inference_combo.clear()
+        for inf_type in self.api_manager.inference_types:
+            self.inference_combo.addItem(inf_type['name'], inf_type['id'])
+        # Восстанавливаем предыдущее значение
+        if current_inference:
+            index = self.inference_combo.findText(current_inference)
+            if index >= 0:
+                self.inference_combo.setCurrentIndex(index)
+
         # Обновляем модели
         logger.debug("update_combos: Загружаем модели из API")
         logger.debug("update_combos: Всего моделей: %d", len(self.api_manager.models))
@@ -634,22 +700,8 @@ class MainWindow(QMainWindow):
         # Очищаем список версий (сбрасываем связанные данные)
         self.inference_version_combo.clear()
 
-        # Находим ID выбранного типа инференса
-        inference_api_name = self.INFERENCE_DISPLAY_TO_API.get(inference_type)
-        inference_id = None
-
-        if inference_api_name:
-            for inf_type in self.api_manager.inference_types:
-                if inf_type['name'] == inference_api_name:
-                    inference_id = inf_type['id']
-                    break
-
-        # Если не нашли ID, пробуем найти по отображаемому имени
-        if not inference_id:
-            for inf_type in self.api_manager.inference_types:
-                if inf_type['name'] == inference_type:
-                    inference_id = inf_type['id']
-                    break
+        # Получаем ID напрямую из itemData комбобокса
+        inference_id = self.inference_combo.currentData()
 
         # Фильтруем версии по ID типа инференса
         if inference_id:
@@ -696,21 +748,14 @@ class MainWindow(QMainWindow):
             total_gpu_count = 1
 
         # Собираем конфигурацию
-        inference_display = self.inference_combo.currentText()
-        inference_api = self.INFERENCE_DISPLAY_TO_API.get(inference_display, inference_display.lower())
-
-        # Находим ID типа инференса
-        inference_type_id = None
-        for inf_type in self.api_manager.inference_types:
-            if inf_type['name'] == inference_api:
-                inference_type_id = inf_type['id']
-                break
+        inference_name = self.inference_combo.currentText()
+        inference_type_id = self.inference_combo.currentData()
 
         if not inference_type_id:
-            QMessageBox.warning(self, "Ошибка", f"Тип инференса '{inference_display}' не найден в справочниках")
+            QMessageBox.warning(self, "Ошибка", f"Тип инференса '{inference_name}' не найден в справочниках")
             return
 
-        logger.debug("Выбран тип инференса: '%s' (API: '%s', ID: %s)", inference_display, inference_api, inference_type_id)
+        logger.debug("Выбран тип инференса: '%s' (ID: %s)", inference_name, inference_type_id)
 
         # Находим ID модели
         model_name = self.model_combo.currentText()
@@ -780,7 +825,7 @@ class MainWindow(QMainWindow):
         logger.debug("Первая GPU для API: '%s' (ID: %s)", gpu_models_names[0] if gpu_models_names else 'N/A', first_gpu_id)
 
         config = {
-            'inference': inference_api,  # Используем API имя для совместимости с LLMBenchmark
+            'inference': inference_name,  # Имя из API для LLMBenchmark
             'inference_id': inference_type_id,  # ID для отправки результатов
             'model': model_name,
             'model_id': model_id,  # ID модели
@@ -796,12 +841,23 @@ class MainWindow(QMainWindow):
             'runs': self.runs_spin.value(),
             'inference_version': inference_version_name,
             'inference_version_id': inference_version_id,  # ID версии инференса
-            'is_docker': self.docker_checkbox.isChecked()
+            'is_docker': self.docker_checkbox.isChecked(),
+            'run_seq_no_so': self.test_seq_no_so_cb.isChecked(),
+            'run_seq_so': self.test_seq_so_cb.isChecked(),
+            'run_par_no_so': self.test_par_no_so_cb.isChecked(),
+            'run_par_so': self.test_par_so_cb.isChecked(),
+            'run_throughput': self.test_throughput_cb.isChecked(),
         }
 
         # Проверяем обязательные поля
         if not config['model'] or not config['base_url']:
             QMessageBox.warning(self, "Ошибка", "Заполните обязательные поля: модель и URL API сервера")
+            return
+
+        # Проверяем, что выбран хотя бы один тест
+        if not any([config['run_seq_no_so'], config['run_seq_so'],
+                     config['run_par_no_so'], config['run_par_so']]):
+            QMessageBox.warning(self, "Ошибка", "Выберите хотя бы один тест для запуска")
             return
 
         # Сохраняем конфигурацию для дальнейшего использования
@@ -866,13 +922,16 @@ class MainWindow(QMainWindow):
         """Обновляет таблицу результатов"""
         self.results_table.setRowCount(6)
 
+        def fmt(val):
+            return f"{val:.2f}" if val is not None else "—"
+
         rows = [
-            ("Последовательный без SO", f"{results['seq_no_so']:.2f}", "ток/сек"),
-            ("Последовательный с SO", f"{results['seq_so']:.2f}", "ток/сек"),
-            ("Параллельный без SO", f"{results['par_no_so']:.2f}", "ток/сек"),
-            ("Параллельный с SO", f"{results['par_so']:.2f}", "ток/сек"),
-            ("Пропускная без SO", f"{results['throughput_no_so']:.2f}", "ток/сек"),
-            ("Пропускная с SO", f"{results['throughput_so']:.2f}", "ток/сек"),
+            ("Последовательный без SO", fmt(results['seq_no_so']), "ток/сек"),
+            ("Последовательный с SO", fmt(results['seq_so']), "ток/сек"),
+            ("Параллельный без SO", fmt(results['par_no_so']), "ток/сек"),
+            ("Параллельный с SO", fmt(results['par_so']), "ток/сек"),
+            ("Пропускная без SO", fmt(results['throughput_no_so']), "ток/сек"),
+            ("Пропускная с SO", fmt(results['throughput_so']), "ток/сек"),
         ]
 
         for i, (param, value, unit) in enumerate(rows):
@@ -902,14 +961,17 @@ class MainWindow(QMainWindow):
                 is_docker=self.current_config.get('is_docker', False)
             )
 
-            # Формируем результаты в нужном формате
+            # Формируем результаты в нужном формате (None → 0.0 для CSV)
+            def val(v):
+                return v if v is not None else 0.0
+
             results = {
-                'seq_no_so': self.current_results['seq_no_so'],
-                'seq_so': self.current_results['seq_so'],
-                'par_no_so': self.current_results['par_no_so'],
-                'par_so': self.current_results['par_so'],
-                'throughput_no_so': self.current_results['throughput_no_so'],
-                'throughput_so': self.current_results['throughput_so'],
+                'seq_no_so': val(self.current_results['seq_no_so']),
+                'seq_so': val(self.current_results['seq_so']),
+                'par_no_so': val(self.current_results['par_no_so']),
+                'par_so': val(self.current_results['par_so']),
+                'throughput_no_so': val(self.current_results['throughput_no_so']),
+                'throughput_so': val(self.current_results['throughput_so']),
             }
 
             # Сохраняем в CSV
@@ -985,12 +1047,12 @@ class MainWindow(QMainWindow):
                 "parallel_count": self.current_config['parallel'],
                 "gpu_configs": gpu_configs,
                 "is_docker": self.current_config.get('is_docker', False),
-                "sequential_no_so": round(self.current_results['seq_no_so'], 2),
-                "sequential_with_so": round(self.current_results['seq_so'], 2),
-                "parallel_no_so": round(self.current_results['par_no_so'], 2),
-                "parallel_with_so": round(self.current_results['par_so'], 2),
-                "throughput_no_so": round(self.current_results['throughput_no_so'], 2),
-                "throughput_with_so": round(self.current_results['throughput_so'], 2),
+                "sequential_no_so": round(self.current_results['seq_no_so'] or 0, 2),
+                "sequential_with_so": round(self.current_results['seq_so'] or 0, 2),
+                "parallel_no_so": round(self.current_results['par_no_so'] or 0, 2),
+                "parallel_with_so": round(self.current_results['par_so'] or 0, 2),
+                "throughput_no_so": round(self.current_results['throughput_no_so'] or 0, 2),
+                "throughput_with_so": round(self.current_results['throughput_so'] or 0, 2),
             }
 
             logger.debug("Отправка результатов: %s", payload)
@@ -1028,6 +1090,11 @@ class MainWindow(QMainWindow):
         self.settings.setValue("runs", self.runs_spin.value())
         self.settings.setValue("inference_version", self.inference_version_combo.currentText())
         self.settings.setValue("is_docker", self.docker_checkbox.isChecked())
+        self.settings.setValue("run_seq_no_so", self.test_seq_no_so_cb.isChecked())
+        self.settings.setValue("run_seq_so", self.test_seq_so_cb.isChecked())
+        self.settings.setValue("run_par_no_so", self.test_par_no_so_cb.isChecked())
+        self.settings.setValue("run_par_so", self.test_par_so_cb.isChecked())
+        self.settings.setValue("run_throughput", self.test_throughput_cb.isChecked())
 
         # Сохраняем данные таблицы GPU
         gpu_data = []
@@ -1088,6 +1155,17 @@ class MainWindow(QMainWindow):
 
         if self.settings.contains("is_docker"):
             self.docker_checkbox.setChecked(self.settings.value("is_docker", type=bool))
+
+        if self.settings.contains("run_seq_no_so"):
+            self.test_seq_no_so_cb.setChecked(self.settings.value("run_seq_no_so", type=bool))
+        if self.settings.contains("run_seq_so"):
+            self.test_seq_so_cb.setChecked(self.settings.value("run_seq_so", type=bool))
+        if self.settings.contains("run_par_no_so"):
+            self.test_par_no_so_cb.setChecked(self.settings.value("run_par_no_so", type=bool))
+        if self.settings.contains("run_par_so"):
+            self.test_par_so_cb.setChecked(self.settings.value("run_par_so", type=bool))
+        if self.settings.contains("run_throughput"):
+            self.test_throughput_cb.setChecked(self.settings.value("run_throughput", type=bool))
 
         # Загружаем данные таблицы GPU
         if self.settings.contains("gpu_data"):
@@ -1338,6 +1416,179 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"Ошибка отправки: {str(e)}")
             QMessageBox.critical(self, "Ошибка", f"Не удалось отправить изменения на портал:\n{str(e)}")
             self.send_references_btn.setEnabled(True)
+
+    def compare_selected_runs(self):
+        """Сравнивает выбранные запуски в отдельном окне"""
+        selected_rows = sorted(set(idx.row() for idx in self.history_table.selectedIndexes()))
+
+        if len(selected_rows) < 2:
+            QMessageBox.warning(self, "Сравнение", "Выберите минимум 2 строки для сравнения")
+            return
+
+        # Названия параметров и индексы метрик
+        param_labels = [
+            "Дата и время", "Описание", "Модель", "Инференс",
+            "Параметры запуска", "GPU кол-во", "GPU модели", "Параллельных"
+        ]
+        metric_labels = [
+            "Послед. без SO", "Послед. с SO",
+            "Паралл. без SO", "Паралл. с SO",
+            "Пропуск. без SO", "Пропуск. с SO"
+        ]
+        metric_cols = list(range(8, 14))  # колонки 8-13 в таблице истории
+
+        # Собираем данные
+        runs_data = []
+        for row in selected_rows:
+            cells = []
+            for col in range(self.history_table.columnCount()):
+                item = self.history_table.item(row, col)
+                cells.append(item.text() if item else "")
+            runs_data.append(cells)
+
+        # Находим лучшие значения по каждой метрике (максимум, пропуская нули)
+        best_values = {}
+        for col_idx in metric_cols:
+            values = []
+            for run in runs_data:
+                try:
+                    val = float(run[col_idx].replace(",", "."))
+                except (ValueError, IndexError):
+                    val = 0.0
+                values.append(val)
+            max_val = max(values)
+            if max_val > 0:
+                best_values[col_idx] = max_val
+
+        # Создаём диалог
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Сравнение запусков")
+        dialog.setMinimumSize(800, 500)
+        apply_dark_title_bar(dialog)
+
+        layout = QVBoxLayout(dialog)
+
+        # Таблица: строки — параметры/метрики, столбцы — запуски
+        num_runs = len(runs_data)
+        all_labels = param_labels + metric_labels
+        table = QTableWidget(len(all_labels), num_runs + 1)
+
+        # Заголовки столбцов
+        header_labels = ["Параметр"]
+        for run in runs_data:
+            model = run[2] if run[2] else "?"
+            date = run[0].split(" ")[0] if run[0] else ""
+            header_labels.append(f"{model}\n{date}")
+        table.setHorizontalHeaderLabels(header_labels)
+
+        # Заполняем таблицу
+        best_color = QColor(80, 250, 123)  # #50fa7b — зелёный из Dracula
+
+        for row_idx, label in enumerate(all_labels):
+            # Первый столбец — название параметра
+            label_item = QTableWidgetItem(label)
+            label_item.setFont(QFont("", -1, QFont.Weight.Bold))
+            table.setItem(row_idx, 0, label_item)
+
+            # Столбцы данных
+            if row_idx < len(param_labels):
+                # Параметры — просто текст
+                col_in_history = row_idx
+                for run_idx, run in enumerate(runs_data):
+                    val = run[col_in_history] if col_in_history < len(run) else ""
+                    table.setItem(row_idx, run_idx + 1, QTableWidgetItem(val))
+            else:
+                # Метрики — с подсветкой лучших
+                col_in_history = metric_cols[row_idx - len(param_labels)]
+                for run_idx, run in enumerate(runs_data):
+                    val_str = run[col_in_history] if col_in_history < len(run) else ""
+                    item = QTableWidgetItem(val_str)
+                    try:
+                        val = float(val_str.replace(",", "."))
+                    except (ValueError, IndexError):
+                        val = 0.0
+                    if col_in_history in best_values and val > 0 and val == best_values[col_in_history]:
+                        item.setForeground(best_color)
+                        item.setFont(QFont("", -1, QFont.Weight.Bold))
+                    table.setItem(row_idx, run_idx + 1, item)
+
+        # Настройка таблицы
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        for i in range(1, num_runs + 1):
+            table.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
+
+        layout.addWidget(table)
+
+        close_btn = QPushButton("Закрыть")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+
+        dialog.exec()
+
+    def on_history_double_click(self, index):
+        """Показывает детальную информацию о выбранном запуске"""
+        row = index.row()
+
+        def cell(col):
+            item = self.history_table.item(row, col)
+            return item.text() if item else ""
+
+        date_time = cell(0)
+        description = cell(1)
+        model = cell(2)
+        inference = cell(3)
+        launch_params = cell(4)
+        gpu_count = cell(5)
+        gpu_models = cell(6)
+        parallel = cell(7)
+        seq_no_so = cell(8)
+        seq_so = cell(9)
+        par_no_so = cell(10)
+        par_so = cell(11)
+        throughput_no_so = cell(12)
+        throughput_so = cell(13)
+
+        detail_text = (
+            f"Дата и время:  {date_time}\n"
+            f"Модель:  {model}\n"
+            f"Инференс:  {inference}\n"
+            f"Описание:  {description}\n"
+            f"\n"
+            f"Параметры запуска:\n{launch_params}\n"
+            f"\n"
+            f"GPU:  {gpu_count}x {gpu_models}\n"
+            f"Параллельных запросов:  {parallel}\n"
+            f"\n"
+            f"{'─' * 40}\n"
+            f"Результаты (ток/сек):\n"
+            f"{'─' * 40}\n"
+            f"Послед. без SO:   {seq_no_so}\n"
+            f"Послед. с SO:     {seq_so}\n"
+            f"Паралл. без SO:   {par_no_so}\n"
+            f"Паралл. с SO:     {par_so}\n"
+            f"Пропуск. без SO:  {throughput_no_so}\n"
+            f"Пропуск. с SO:    {throughput_so}\n"
+        )
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Детали запуска — {model}")
+        dialog.setMinimumSize(550, 400)
+        apply_dark_title_bar(dialog)
+
+        layout = QVBoxLayout(dialog)
+
+        text_edit = QTextEdit()
+        text_edit.setPlainText(detail_text)
+        text_edit.setReadOnly(True)
+        layout.addWidget(text_edit)
+
+        close_btn = QPushButton("Закрыть")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+
+        dialog.exec()
 
     def load_csv_history(self):
         """Загружает историю результатов из CSV файла"""
@@ -1806,6 +2057,7 @@ def main():
     app.setStyleSheet(dracula_stylesheet)
 
     window = MainWindow()
+    apply_dark_title_bar(window)
     window.show()
 
     sys.exit(app.exec())
